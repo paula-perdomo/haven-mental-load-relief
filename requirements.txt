@@ -3,3 +3,8 @@ langchain
 langchain-google-genai
 python-dotenv
 pydantic
+fastapi
+uvicorn
+PyJWT
+python-multipart
+httpx

@@ -22,6 +22,12 @@ def build_ui(page: ft.Page):
         expand=True,
         spacing=10,
         auto_scroll=True,
+        controls=[
+            ft.Text(
+                "Haven AI:\nHi, I'm Haven, your Family Logistics Copilot! I can help you reduce your mental load by automatically parsing complex schedules, managing shared lists, and preparing packing routines. Need help? Just type your thoughts or upload a picture of a school calendar, and I'll organize it for you!", 
+                color=ft.Colors.LIGHT_GREEN_200
+            )
+        ]
     )
 
     def send_message(e):

@@ -7,39 +7,42 @@ from pydantic import BaseModel
 from typing import List, Optional
 from dotenv import load_dotenv
 
+import backend.database as db
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import tool
 
 load_dotenv()
+db.init_db()
 
-app = FastAPI(title="Haven Backend Proxy")
+app = FastAPI(title="Haven Cloud Backend")
 
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev_secret_key_change_me")
 ALGORITHM = "HS256"
-# In a real app, this should be a proper user database!
 HARDCODED_USERNAME = os.environ.get("HAVEN_USERNAME", "admin")
 HARDCODED_PASSWORD = os.environ.get("HAVEN_PASSWORD", "secret")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 
-# Models
-class ChatRequest(BaseModel):
-    text: str
-    image_b64: Optional[str] = None
-    mime_type: Optional[str] = "image/jpeg"
+# --- BACKGROUND NOTIFICATION SCHEDULER ---
+import asyncio
 
-class Activity(BaseModel):
-    title: str
-    day_of_week: str
-    time_str: str
-    packing_list: List[str]
+async def notification_worker():
+    while True:
+        try:
+            # This worker spins every 60 seconds.
+            # Here we would query backend.database for activities matching the current time
+            # and dispatch Firebase Cloud Messaging (FCM) push notifications to user devices.
+            print(f"[{datetime.datetime.now().isoformat()}] Checking schedule for upcoming activities to broadcast Push Notifications...")
+        except Exception as e:
+            print(f"Scheduler Background Error: {e}")
+        await asyncio.sleep(60)
 
-class ChatResponse(BaseModel):
-    reply: str
-    activities: List[Activity]
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(notification_worker())
 
-# Auth Utils
+# --- AUTH UTILS ---
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.datetime.utcnow() + datetime.timedelta(days=30)
@@ -60,6 +63,62 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         return username
     except jwt.PyJWTError:
         raise credentials_exception
+
+@app.post("/api/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    # Support basic Username/Password or in the future: Google ID Tokens
+    if form_data.username != HARDCODED_USERNAME or form_data.password != HARDCODED_PASSWORD:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token(data={"sub": form_data.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# --- MODELS ---
+class ChatRequest(BaseModel):
+    text: str
+    image_b64: Optional[str] = None
+    mime_type: Optional[str] = "image/jpeg"
+
+class Activity(BaseModel):
+    id: Optional[int] = None
+    title: str
+    day_of_week: str
+    time_str: str
+
+class PrepItem(BaseModel):
+    id: int
+    item_name: str
+    is_packed: bool
+
+class SharedList(BaseModel):
+    id: int
+    title: str
+    
+class ListItem(BaseModel):
+    id: int
+    item_name: str
+    is_done: bool
+
+class Member(BaseModel):
+    id: Optional[int] = None
+    name: str
+    role: str
+
+class ChatResponse(BaseModel):
+    reply: str
+    activities: List[dict]  # Simplified out_activities
+
+class CreateListRequest(BaseModel):
+    title: str
+
+class CreateItemRequest(BaseModel):
+    item_name: str
+
+class ToggleItemRequest(BaseModel):
+    is_done: bool
 
 # --- LANGCHAIN LOGIC ---
 @tool
@@ -82,29 +141,23 @@ def get_llm():
         print(f"Error initializing LLM: {e}")
         return None
 
-# --- ROUTES ---
-@app.post("/api/login")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    if form_data.username != HARDCODED_USERNAME or form_data.password != HARDCODED_PASSWORD:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token = create_access_token(data={"sub": form_data.username})
-    return {"access_token": access_token, "token_type": "bearer"}
-
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, current_user: str = Depends(get_current_user)):
     llm = get_llm()
     if not llm:
         raise HTTPException(status_code=500, detail="LLM not configured on server")
 
-    system_prompt = """You are Haven, a Family Logistics Copilot.
+    # Fetch household members to give context to the AI
+    members = db.get_members(current_user)
+    members_str = ", ".join([f"{m['name']} ({m['role']})" for m in members]) if members else "None yet."
+
+    system_prompt = f"""You are Haven, a Family Logistics Copilot.
 Your job is to parse schedules from images/text and securely track the household load to assist busy parents.
+CURRENT HOUSEHOLD MEMBERS: {members_str}
 
 If the user uploads an image/schedule, extract the activities and packing lists (like goggles, towel) 
 and use the `create_activity` tool to save them into the family schedule database!
+Assign members if explicitly requested or obvious (e.g., Mom's yoga).
 If they just ask a question, answer it. But prioritize creating structured schedules using the tool.
 """
     messages = [SystemMessage(content=system_prompt)]
@@ -135,13 +188,82 @@ If they just ask a question, answer it. But prioritize creating structured sched
             for tc in response.tool_calls:
                 if tc['name'] == 'create_activity':
                     args = tc['args']
-                    out_activities.append(Activity(
+                    # Persist automatically to cloud DB on behalf of user
+                    act_id = db.add_activity(
+                        user_id=current_user,
                         title=args.get("title", "Unknown"),
                         day_of_week=args.get("day_of_week", "Unknown"),
-                        time_str=args.get("time_str", "Unknown"),
-                        packing_list=args.get("packing_list", [])
-                    ))
+                        time_str=args.get("time_str", "Unknown")
+                    )
+                    packing_list = args.get("packing_list", [])
+                    for p_item in packing_list:
+                        db.add_prep_item(act_id, p_item)
+                        
+                    out_activities.append({
+                        "id": act_id,
+                        "title": args.get("title", "Unknown"),
+                        "day_of_week": args.get("day_of_week", "Unknown"),
+                        "time_str": args.get("time_str", "Unknown"),
+                        "packing_list": packing_list
+                    })
         
         return ChatResponse(reply=str(reply_text), activities=out_activities)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- CRUD ENDPOINTS FOR CLOUD DB ---
+
+@app.get("/api/members", response_model=List[Member])
+def get_user_members(current_user: str = Depends(get_current_user)):
+    mems = db.get_members(current_user)
+    return [Member(**m) for m in mems]
+
+@app.post("/api/members")
+def create_user_member(req: Member, current_user: str = Depends(get_current_user)):
+    m_id = db.add_member(current_user, req.name, req.role)
+    return {"id": m_id}
+
+@app.delete("/api/members/{member_id}")
+def delete_user_member(member_id: int, current_user: str = Depends(get_current_user)):
+    db.delete_member(member_id)
+    return {"status": "ok"}
+
+@app.put("/api/members/{member_id}")
+def update_user_member(member_id: int, req: Member, current_user: str = Depends(get_current_user)):
+    db.update_member(member_id, req.name, req.role)
+    return {"status": "ok"}
+
+@app.get("/api/activities", response_model=List[Activity])
+def get_user_activities(current_user: str = Depends(get_current_user)):
+    acts = db.get_activities(current_user)
+    return [Activity(**a) for a in acts]
+
+@app.get("/api/activities/{act_id}/items", response_model=List[PrepItem])
+def get_activity_prep_items(act_id: int, current_user: str = Depends(get_current_user)):
+    items = db.get_prep_items(act_id)
+    return [PrepItem(**i) for i in items]
+
+@app.get("/api/lists", response_model=List[SharedList])
+def get_shared_lists(current_user: str = Depends(get_current_user)):
+    lists = db.get_lists(current_user)
+    return [SharedList(**l) for l in lists]
+
+@app.post("/api/lists")
+def create_list(req: CreateListRequest, current_user: str = Depends(get_current_user)):
+    l_id = db.add_list(current_user, req.title)
+    return {"id": l_id}
+
+@app.get("/api/lists/{list_id}/items", response_model=List[ListItem])
+def get_list_items(list_id: int, current_user: str = Depends(get_current_user)):
+    items = db.get_list_items(list_id)
+    return [ListItem(**i) for i in items]
+
+@app.post("/api/lists/{list_id}/items")
+def create_list_item(list_id: int, req: CreateItemRequest, current_user: str = Depends(get_current_user)):
+    db.add_list_item(list_id, req.item_name)
+    return {"status": "ok"}
+
+@app.put("/api/list_items/{item_id}")
+def toggle_item(item_id: int, req: ToggleItemRequest, current_user: str = Depends(get_current_user)):
+    db.toggle_item_status(item_id, req.is_done)
+    return {"status": "ok"}

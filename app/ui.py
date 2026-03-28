@@ -202,15 +202,28 @@ def build_ui(page: ft.Page):
             items = db.get_list_items(current_list_id[0])
             search_query = search_item_input.value.lower() if search_item_input.value else ""
             
+            active_items = []
+            done_items = []
             for item in items:
                 if search_query and search_query not in item["item_name"].lower():
                     continue
                 
                 def toggle(e, iid=item["id"]):
                     db.toggle_item_status(iid, e.control.value)
+                    refresh_items_list()
                     
                 cb = ft.Checkbox(label=item["item_name"], value=item["is_done"], on_change=toggle)
-                items_list_view.controls.append(cb)
+                if item["is_done"]:
+                    cb.label_style = ft.TextStyle(decoration=ft.TextDecoration.LINE_THROUGH, color=ft.Colors.GREY_500)
+                    done_items.append(cb)
+                else:
+                    active_items.append(cb)
+            
+            items_list_view.controls.extend(active_items)
+            if done_items:
+                if active_items:
+                    items_list_view.controls.append(ft.Divider())
+                items_list_view.controls.extend(done_items)
             page.update()
             
         list_details_col.controls.extend([
@@ -225,11 +238,122 @@ def build_ui(page: ft.Page):
         page.update()
 
 
+    # ---- HOUSEHOLD TAB ----
+    household_col = ft.Column(expand=True)
+    new_member_name = ft.TextField(label="Member Name (e.g., Mom)", expand=1)
+    new_member_role = ft.TextField(label="Role (e.g., Parent)", expand=1)
+    members_list_view = ft.ListView(expand=True, spacing=5)
+
+    def load_members():
+        members_list_view.controls.clear()
+        mems = db.get_members()
+        if not mems:
+            members_list_view.controls.append(ft.Text("No household members yet.", color=ft.Colors.GREY_400))
+        for m in mems:
+            def make_delete_click(mid):
+                def on_click(e):
+                    db.delete_member(mid)
+                    load_members()
+                return on_click
+                
+            def make_edit_click(m_data):
+                def on_click(e):
+                    edit_name = ft.TextField(label="Name", value=m_data['name'])
+                    edit_role = ft.TextField(label="Role", value=m_data['role'])
+                    
+                    def save_edit(e2):
+                        db.update_member(m_data['id'], edit_name.value.strip(), edit_role.value.strip())
+                        page.dialog.open = False
+                        page.update()
+                        load_members()
+                        
+                    def close_dlg(e2):
+                        page.dialog.open = False
+                        page.update()
+                        
+                    dlg = ft.AlertDialog(
+                        title=ft.Text("Edit Member"),
+                        content=ft.Column([edit_name, edit_role], tight=True),
+                        actions=[
+                            ft.TextButton("Cancel", on_click=close_dlg),
+                            ft.TextButton("Save", on_click=save_edit)
+                        ],
+                        actions_alignment=ft.MainAxisAlignment.END
+                    )
+                    page.dialog = dlg
+                    dlg.open = True
+                    page.update()
+                return on_click
+
+            card = ft.Card(
+                content=ft.Container(
+                    padding=10,
+                    content=ft.Row([
+                        ft.Row([
+                            ft.Icon(ft.Icons.PERSON),
+                            ft.Text(f"{m['name']} ({m['role']})", size=16, weight=ft.FontWeight.W_500)
+                        ]),
+                        ft.Row([
+                            ft.IconButton(icon=ft.Icons.EDIT, icon_color=ft.Colors.BLUE, tooltip="Edit", on_click=make_edit_click(m)),
+                            ft.IconButton(icon=ft.Icons.DELETE, icon_color=ft.Colors.RED, tooltip="Delete", on_click=make_delete_click(m['id']))
+                        ])
+                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+                )
+            )
+            members_list_view.controls.append(card)
+        if page.navigation_bar and page.navigation_bar.selected_index == 3:
+            page.update()
+
+    def add_member_click(e):
+        name = new_member_name.value.strip()
+        role = new_member_role.value.strip()
+        if name and role:
+            db.add_member(name, role)
+            new_member_name.value = ""
+            new_member_role.value = ""
+            load_members()
+
+    add_member_btn = ft.ElevatedButton("Add Member", on_click=add_member_click)
+    
+    household_tab_content = ft.Column([
+        ft.Text("Household Database", size=20, weight=ft.FontWeight.BOLD),
+        ft.Row([new_member_name, new_member_role]),
+        add_member_btn,
+        ft.Divider(),
+        members_list_view
+    ], expand=True)
+
     # ---- SETTINGS TAB ----
+    import os
     server_url_input = ft.TextField(label="Server URL", value=db.get_config("SERVER_URL") or "http://127.0.0.1:8000")
     username_input = ft.TextField(label="Username", value=db.get_config("USERNAME") or "")
     password_input = ft.TextField(label="Password", password=True, can_reveal_password=True)
     settings_status = ft.Text("")
+    
+    # Google OAuth Infrastructure
+    GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+    if GOOGLE_CLIENT_ID:
+        google_provider = ft.OAuthProvider(
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+            authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+            token_endpoint="https://oauth2.googleapis.com/token",
+            redirect_url="http://localhost:8550/oauth_callback", 
+            user_scopes=["email", "profile"]
+        )
+        def on_google_login(e):
+            if e.error:
+                settings_status.value = f"Google Login Error: {e.error}"
+                settings_status.color = ft.Colors.RED
+            else:
+                db.set_config("JWT_TOKEN", page.auth.token.access_token)
+                settings_status.value = "Google Account Linked!"
+                settings_status.color = ft.Colors.GREEN
+            page.update()
+        page.on_login = on_google_login
+        google_login_btn = ft.ElevatedButton("Sign in with Google", on_click=lambda e: page.login(google_provider), icon=ft.Icons.CLOUD_DONE)
+    else:
+        google_login_btn = ft.ElevatedButton("Sign in with Google (Missing Config)", disabled=True)
 
     def save_settings(e):
         settings_status.value = "Authenticating..."
@@ -264,6 +388,10 @@ def build_ui(page: ft.Page):
         username_input,
         password_input,
         save_btn,
+        ft.Divider(),
+        ft.Text("Cloud Sync", size=20, weight=ft.FontWeight.BOLD),
+        ft.Text("Config GOOGLE_CLIENT_ID in your env to enable OAuth token exchange.", color=ft.Colors.GREY_500),
+        google_login_btn,
         settings_status
     ], expand=True)
 
@@ -281,6 +409,9 @@ def build_ui(page: ft.Page):
             render_lists_overview()
             main_container.content = lists_main_container
         elif idx == 3:
+            load_members()
+            main_container.content = household_tab_content
+        elif idx == 4:
             main_container.content = settings_tab_content
         page.update()
 
@@ -289,6 +420,7 @@ def build_ui(page: ft.Page):
             ft.NavigationBarDestination(icon=ft.Icons.CHAT, label="Chat"),
             ft.NavigationBarDestination(icon=ft.Icons.CALENDAR_MONTH, label="Schedule"),
             ft.NavigationBarDestination(icon=ft.Icons.LIST_ALT, label="Lists"),
+            ft.NavigationBarDestination(icon=ft.Icons.FAMILY_RESTROOM, label="Household"),
             ft.NavigationBarDestination(icon=ft.Icons.SETTINGS, label="Settings"),
         ],
         on_change=switch_tab

@@ -1,7 +1,7 @@
 import os
 import base64
 import httpx
-from app.database import get_config, add_activity, add_prep_item
+from app.database import get_config
 
 def process_user_input(user_text: str, file_path: str = None) -> str:
     # Get the JWT token from config
@@ -45,16 +45,6 @@ def process_user_input(user_text: str, file_path: str = None) -> str:
         reply_text = data.get("reply", "No text response.")
         activities = data.get("activities", [])
         
-        # Save activities to Local DB
-        for act in activities:
-            act_id = add_activity(
-                title=act["title"],
-                day_of_week=act["day_of_week"],
-                time_str=act["time_str"]
-            )
-            for item in act.get("packing_list", []):
-                add_prep_item(act_id, item)
-                
         if activities:
             return f"Added {len(activities)} activities to your schedule.\n\n{reply_text}"
         return reply_text

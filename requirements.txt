@@ -8,3 +8,5 @@ uvicorn
 PyJWT
 python-multipart
 httpx
+pychromecast
+gTTS

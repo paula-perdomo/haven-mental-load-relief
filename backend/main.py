@@ -26,14 +26,80 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 
 # --- BACKGROUND NOTIFICATION SCHEDULER ---
 import asyncio
+import socket
+import os
+import time
+from fastapi.staticfiles import StaticFiles
+
+# Setup static files for Google Hub to access the TTS MP3s
+os.makedirs("backend/static/announcements", exist_ok=True)
+app.mount("/static", StaticFiles(directory="backend/static"), name="static")
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        return s.getsockname()[0]
+    except Exception:
+        return '127.0.0.1'
+    finally:
+        s.close()
+
+LOCAL_IP = get_local_ip()
+NOTIFIED_ACTIVITIES = set()
+
+def cast_announcement(activity_id, title, time_str):
+    if activity_id in NOTIFIED_ACTIVITIES:
+        return
+        
+    try:
+        from gtts import gTTS
+        import pychromecast
+        
+        print(f"Generating TTS for {title}...")
+        text = f"Haven Reminder. {title} is coming up at {time_str}. Please get everything ready."
+        filename = f"act_{activity_id}.mp3"
+        filepath = os.path.join("backend/static/announcements", filename)
+        
+        tts = gTTS(text=text, lang='en')
+        tts.save(filepath)
+        
+        audio_url = f"http://{LOCAL_IP}:8000/static/announcements/{filename}"
+        print(f"Looking for Google Hubs to cast {audio_url}...")
+        
+        chromecasts, browser = pychromecast.get_chromecasts()
+        browser.stop_discovery()
+        
+        if not chromecasts:
+            print("No Chromecast devices found on network.")
+            return
+            
+        cast = chromecasts[0] # Grab the first available Google Hub/Home
+        cast.wait()
+        mc = cast.media_controller
+        mc.play_media(audio_url, 'audio/mp3')
+        mc.block_until_active()
+        print(f"Successfully broadcasted to {cast.name}")
+        
+        NOTIFIED_ACTIVITIES.add(activity_id)
+            
+    except Exception as e:
+        print(f"Error casting announcement: {e}")
 
 async def notification_worker():
     while True:
         try:
-            # This worker spins every 60 seconds.
-            # Here we would query backend.database for activities matching the current time
-            # and dispatch Firebase Cloud Messaging (FCM) push notifications to user devices.
-            print(f"[{datetime.datetime.now().isoformat()}] Checking schedule for upcoming activities to broadcast Push Notifications...")
+            print(f"[{datetime.datetime.now().isoformat()}] Checking schedule for upcoming activities...")
+            import backend.database as db
+            acts = db.get_activities(HARDCODED_USERNAME)
+            
+            # For demonstration, broadcast the first un-notified activity
+            for a in acts:
+                act_id = a['id']
+                if act_id not in NOTIFIED_ACTIVITIES:
+                    await asyncio.to_thread(cast_announcement, act_id, a["title"], a["time_str"])
+                    break
+                    
         except Exception as e:
             print(f"Scheduler Background Error: {e}")
         await asyncio.sleep(60)
